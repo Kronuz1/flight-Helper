@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from core import alternate, procedures, router, runway, weather
+from core import aircraft, alternate, procedures, router, runway, weather
 from core.runway import RunwayWind
 from navdata import db
 from navdata.db import Airport, Procedure
@@ -60,33 +60,43 @@ def _wind_line(m: weather.Metar | None) -> str:
 
 
 def _build_route(dep: Airport, sid: Procedure | None,
-                 dest: Airport, star: Procedure | None) -> str:
-    """Полная строка маршрута в формате ИКАО."""
+                 dest: Airport, star: Procedure | None) -> tuple[str, float]:
+    """Строка маршрута в формате ИКАО и его геометрическая длина (морские мили)."""
     sid_exit = procedures._last_fix(sid) if sid else None
     star_entry = procedures._first_fix(star) if star else None
+    gc = router.great_circle_nm
 
     tokens: list[str] = [dep.icao]
     if sid:
         tokens.append(_proc_display(sid.name))
 
     if sid_exit and star_entry:
-        enroute = router.route_between(
+        enroute, enroute_nm = router.route_with_distance(
             router.Fix(sid_exit.name, sid_exit.lat, sid_exit.lon),
             router.Fix(star_entry.name, star_entry.lat, star_entry.lon),
         )
         tokens += enroute
+        total_nm = (gc(dep.lat, dep.lon, sid_exit.lat, sid_exit.lon)
+                    + enroute_nm
+                    + gc(star_entry.lat, star_entry.lon, dest.lat, dest.lon))
     elif sid_exit:
         tokens.append(sid_exit.name)
+        total_nm = (gc(dep.lat, dep.lon, sid_exit.lat, sid_exit.lon)
+                    + gc(sid_exit.lat, sid_exit.lon, dest.lat, dest.lon))
     elif star_entry:
         tokens += ["DCT", star_entry.name]
+        total_nm = (gc(dep.lat, dep.lon, star_entry.lat, star_entry.lon)
+                    + gc(star_entry.lat, star_entry.lon, dest.lat, dest.lon))
+    else:
+        total_nm = gc(dep.lat, dep.lon, dest.lat, dest.lon)
 
     if star:
         tokens.append(_proc_display(star.name))
     tokens.append(dest.icao)
-    return " ".join(tokens)
+    return " ".join(tokens), total_nm
 
 
-async def build_plan(dep_icao: str, dest_icao: str) -> str:
+async def build_plan(dep_icao: str, dest_icao: str, ac_code: str = "A320") -> str:
     dep_icao, dest_icao = dep_icao.upper(), dest_icao.upper()
     dep = db.get_airport(dep_icao)
     dest = db.get_airport(dest_icao)
@@ -94,11 +104,13 @@ async def build_plan(dep_icao: str, dest_icao: str) -> str:
         return f"❌ Аэропорт вылета <b>{dep_icao}</b> не найден в базе."
     if dest is None:
         return f"❌ Аэропорт назначения <b>{dest_icao}</b> не найден в базе."
+    ac = aircraft.get(ac_code)
+    if ac is None:
+        return f"❌ Неизвестный тип ВС <b>{ac_code}</b>."
 
     d = await _analyze(dep_icao)
     a = await _analyze(dest_icao)
     info = db.airac_info()
-    dist = great_circle_km(dep, dest)
 
     # Посадочную ВПП выбираем среди полос с опубликованным заходом:
     # оптимальная по ветру может не иметь захода (напр. URSS 24 — горы/море).
@@ -126,10 +138,43 @@ async def build_plan(dep_icao: str, dest_icao: str) -> str:
     sid = sid_pick[0].procedure if sid_pick else None
     star = star_pick[0].procedure if star_pick else None
 
+    # маршрут, реальная дистанция и запасной (нужен для расчёта топлива)
+    route, route_nm = _build_route(dep, sid, dest, star)
+    bad = alternate.is_bad_weather(a.metar)
+    altn = await alternate.find_alternate(dest)
+    altn_nm = altn.distance_km / 1.852 if altn else 0.0
+
+    # эшелон / время / топливо
+    track = procedures.bearing(dep.lat, dep.lon, dest.lat, dest.lon)
+    fl = aircraft.cruise_fl_semicircular(track, ac.cruise_fl)
+    ete = aircraft.format_hm(aircraft.ete_hours(route_nm, ac))
+    fuel = aircraft.fuel_estimate(route_nm, altn_nm, ac)
+    route_km = int(round(route_nm * 1.852))
+
+    # предупреждения по длине ВПП под выбранное ВС
+    warns: list[str] = []
+    if d.rw and d.rw.runway.length_ft < ac.min_runway_ft:
+        warns.append(f"⚠️ ВПП вылета {d.rw.runway.ident}: {d.rw.runway.length_ft} фт "
+                     f"< потребных {ac.min_runway_ft} фт для {ac.code}")
+    if land_rw and land_rw.runway.length_ft < ac.min_runway_ft:
+        warns.append(f"⚠️ ВПП посадки {land_rw.runway.ident}: {land_rw.runway.length_ft} фт "
+                     f"< потребных {ac.min_runway_ft} фт для {ac.code}")
+
     lines: list[str] = []
     lines.append(f"🛫 <b>ПЛАН ПОЛЁТА</b>  {dep_icao} → {dest_icao}")
     lines.append(f"<i>AIRAC {info.get('airac_cycle','?')} · {info.get('airac_valid','')}</i>")
-    lines.append(f"📏 Дистанция: ~{dist} км")
+    lines.append("")
+
+    # ── ВС / ЭШЕЛОН / ТОПЛИВО ──
+    lines.append("━━━ <b>ВС · ЭШЕЛОН · ТОПЛИВО</b> ━━━")
+    lines.append(f"🛩 Тип: <b>{ac.code}</b> — {ac.name}")
+    lines.append(f"📊 Эшелон: <b>FL{fl}</b> · крейсер {ac.cruise_tas} уз")
+    lines.append(f"📏 Маршрут: ~{route_km} км ({int(round(route_nm))} nm)")
+    lines.append(f"⏱ В пути (без ветра): ~{ete}")
+    lines.append(f"⛽ Block fuel: <b>{fuel['block']}</b> кг")
+    lines.append(f"   trip {fuel['trip']} · запасной {fuel['alternate']} · "
+                 f"резерв {fuel['reserve']} · руление {fuel['taxi']} · непредв. {fuel['contingency']}")
+    lines.extend(warns)
     lines.append("")
 
     # ── ВЫЛЕТ ──
@@ -146,7 +191,6 @@ async def build_plan(dep_icao: str, dest_icao: str) -> str:
     lines.append("")
 
     # ── МАРШРУТ ──
-    route = _build_route(dep, sid, dest, star)
     lines.append("━━━ <b>МАРШРУТ</b> ━━━")
     lines.append(f"<code>{route}</code>")
     lines.append("")
@@ -163,27 +207,25 @@ async def build_plan(dep_icao: str, dest_icao: str) -> str:
         if app_pick:
             apps = procedures.select_approach(dest, land_ident)
             lines.append(f"🎯 Заход: <b>{app_pick[0].procedure.name}</b>")
-            alt = ", ".join(p.procedure.name for p in apps[1:4])
-            if alt:
-                lines.append(f"   альт.: {alt}")
+            alt_apps = ", ".join(p.procedure.name for p in apps[1:4])
+            if alt_apps:
+                lines.append(f"   альт.: {alt_apps}")
         else:
             lines.append("🎯 Заход: не найден")
     else:
         lines.append("Нет данных о ВПП")
 
     # ── ЗАПАСНОЙ АЭРОДРОМ ──
-    bad = alternate.is_bad_weather(a.metar)
-    alt = await alternate.find_alternate(dest)
     lines.append("")
     if bad:
         lines.append("⚠️ <b>В пункте назначения непогода — запасной:</b>")
     else:
         lines.append("🅰️ <b>Запасной аэродром:</b>")
-    if alt:
-        cat = f" [{alt.metar.flight_category}]" if alt.metar and alt.metar.flight_category else ""
-        lines.append(f"{alt.airport.icao} {alt.airport.name} (~{alt.distance_km} км){cat}")
-        if alt.metar:
-            lines.append(f"   {_wind_line(alt.metar)}")
+    if altn:
+        cat = f" [{altn.metar.flight_category}]" if altn.metar and altn.metar.flight_category else ""
+        lines.append(f"{altn.airport.icao} {altn.airport.name} (~{altn.distance_km} км){cat}")
+        if altn.metar:
+            lines.append(f"   {_wind_line(altn.metar)}")
     else:
         lines.append("подходящий не найден в радиусе поиска")
 

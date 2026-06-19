@@ -1,15 +1,21 @@
 """Хендлеры Telegram-бота (aiogram 3.x)."""
 from __future__ import annotations
 
+import logging
 import re
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message
+from aiogram.types import (
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 
-from core import planner, runway, weather
+from core import aircraft, planner, runway, weather
 from navdata import db
 
 router = Router()
@@ -17,13 +23,13 @@ router = Router()
 ICAO_RE = re.compile(r"^[A-Za-z]{4}$")
 
 HELP = (
-    "✈️ <b>Планировщик полётов MSFS 2020</b>\n"
+    "✈️ <b>Планировщик полётов MSFS 2020 (IFR / коммерческий)</b>\n"
     "Навбаза: Navigraph AIRAC, погода: aviationweather.gov\n\n"
     "<b>Команды:</b>\n"
-    "/plan — полный план: активные ВПП, SID/STAR/заход, маршрут по\n"
-    "        трассам в формате ИКАО и запасной аэродром\n"
+    "/plan — полный план: тип ВС, эшелон/время/топливо, активные ВПП,\n"
+    "        SID/STAR/заход, маршрут по трассам (верхние) и запасной\n"
     "/metar &lt;ICAO&gt; — текущая погода + расшифровка кода\n"
-    "/taf &lt;ICAO&gt; — прогноз TAF\n"
+    "/taf &lt;ICAO&gt; — прогноз TAF + расшифровка\n"
     "/rwy &lt;ICAO&gt; — активная ВПП по ветру\n"
     "/cancel — отменить ввод\n\n"
     "Пример: <code>/metar UUEE</code>"
@@ -33,6 +39,17 @@ HELP = (
 class PlanFSM(StatesGroup):
     departure = State()
     destination = State()
+    aircraft = State()
+
+
+def _aircraft_keyboard() -> ReplyKeyboardMarkup:
+    btns = [KeyboardButton(text=a.code) for a in aircraft.all_aircraft()]
+    rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
+
+
+def _aircraft_list_text() -> str:
+    return "\n".join(f"• <b>{a.code}</b> — {a.name}" for a in aircraft.all_aircraft())
 
 
 # --------------------------------------------------------------------------- #
@@ -84,7 +101,7 @@ async def cmd_taf(message: Message, command: CommandObject):
     if not taf:
         await message.answer(f"TAF для {icao} недоступен.")
         return
-    await message.answer(f"<b>TAF {icao}</b>\n<code>{taf}</code>")
+    await message.answer(weather.format_taf(taf, icao))
 
 
 @router.message(Command("rwy"))
@@ -143,9 +160,28 @@ async def plan_destination(message: Message, state: FSMContext):
     if not db.airport_exists(dest):
         await message.answer(f"Аэропорт {dest} не найден. Повторите или /cancel.")
         return
+    await state.update_data(dest=dest)
+    await state.set_state(PlanFSM.aircraft)
+    await message.answer(
+        f"✅ Назначение: <b>{dest}</b>\n🛩 Выберите тип ВС:\n{_aircraft_list_text()}",
+        reply_markup=_aircraft_keyboard(),
+    )
+
+
+@router.message(PlanFSM.aircraft, F.text)
+async def plan_aircraft(message: Message, state: FSMContext):
+    code = message.text.strip().upper()
+    if aircraft.get(code) is None:
+        await message.answer("Выберите тип ВС кнопкой или введите его код. /cancel — отмена.")
+        return
     data = await state.get_data()
-    dep = data["dep"]
+    dep, dest = data["dep"], data["dest"]
     await state.clear()
-    await message.answer("⏳ Строю план, запрашиваю погоду…")
-    card = await planner.build_plan(dep, dest)
+    await message.answer("⏳ Строю план, запрашиваю погоду…", reply_markup=ReplyKeyboardRemove())
+    try:
+        card = await planner.build_plan(dep, dest, code)
+    except Exception:
+        logging.exception("build_plan failed: %s → %s (%s)", dep, dest, code)
+        card = ("❌ Не удалось построить план — сбой сети или погодного сервиса. "
+                "Попробуйте позже.")
     await message.answer(card)

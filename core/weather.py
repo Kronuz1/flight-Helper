@@ -342,6 +342,96 @@ def decode_metar_raw(raw: str) -> list[str]:
     return lines
 
 
+# ---- расшифровка TAF ------------------------------------------------------- #
+_TAF_VALID = re.compile(r"^(\d{2})(\d{2})/(\d{2})(\d{2})$")  # период DDHH/DDHH
+_TAF_FM = re.compile(r"^FM(\d{2})(\d{2})(\d{2})$")           # FMDDHHmm
+_TAF_PROB = re.compile(r"^PROB(\d{2})$")
+_CHANGE_LABEL = {"TEMPO": "Временами", "BECMG": "Постепенно", "INTER": "Кратковременно"}
+
+
+def _taf_period(m: re.Match) -> str:
+    return f"{m.group(1)} {m.group(2)}:00–{m.group(3)} {m.group(4)}:00 UTC"
+
+
+def _decode_taf_token(tok: str) -> str | None:
+    for decoder in (_decode_wind, _decode_visibility, _decode_clouds, _decode_weather):
+        res = decoder(tok)
+        if res:
+            return res
+    return None
+
+
+def decode_taf_raw(raw: str) -> list[str]:
+    """Построчная расшифровка TAF: периоды действия и группы изменений на русском.
+
+    Заголовок группы (основной прогноз / FM / TEMPO / BECMG / PROB) — отдельной
+    строкой, метеотокены под ним с маркером «•» (через декодеры METAR).
+    """
+    if not raw:
+        return []
+    tokens = raw.replace("=", "").split()
+    n = len(tokens)
+    idx = 0
+    while idx < n and tokens[idx] in ("TAF", "AMD", "COR"):
+        idx += 1
+    if idx < n and re.fullmatch(r"[A-Z]{4}", tokens[idx]):
+        idx += 1  # код аэродрома — в заголовке
+    lines: list[str] = []
+    if idx < n and re.fullmatch(r"\d{6}Z", tokens[idx]):
+        t = tokens[idx]
+        lines.append(f"Выпуск: {t[:2]}-е число, {t[2:4]}:{t[4:6]} UTC")
+        idx += 1
+    if idx < n and (m := _TAF_VALID.match(tokens[idx])):
+        lines.append(f"Период действия: {_taf_period(m)}")
+        idx += 1
+    lines.append("Основной прогноз:")
+
+    while idx < n:
+        tok = tokens[idx]
+        if m := _TAF_FM.match(tok):
+            lines.append(f"С {m.group(1)} {m.group(2)}:{m.group(3)} UTC:")
+            idx += 1
+            continue
+        if tok in _CHANGE_LABEL:
+            period = ""
+            if idx + 1 < n and (pm := _TAF_VALID.match(tokens[idx + 1])):
+                period = f" ({_taf_period(pm)})"
+                idx += 1
+            lines.append(f"{_CHANGE_LABEL[tok]}{period}:")
+            idx += 1
+            continue
+        if mp := _TAF_PROB.match(tok):
+            prob, extra = mp.group(1), ""
+            nxt = tokens[idx + 1] if idx + 1 < n else ""
+            if nxt in ("TEMPO", "INTER"):
+                extra = " (" + _CHANGE_LABEL[nxt].lower() + ")"
+                idx += 1
+            period = ""
+            if idx + 1 < n and (pm := _TAF_VALID.match(tokens[idx + 1])):
+                period = f" {_taf_period(pm)}"
+                idx += 1
+            lines.append(f"Вероятность {prob}%{extra}{period}:")
+            idx += 1
+            continue
+        res = _decode_taf_token(tok)
+        if res:
+            lines.append("• " + res)
+        idx += 1
+    return lines
+
+
+def format_taf(raw: str, icao: str = "") -> str:
+    if not raw:
+        return "TAF недоступен."
+    head = f"<b>TAF {icao}</b>".rstrip()
+    lines = [head, f"<code>{raw}</code>"]
+    decoded = decode_taf_raw(raw)
+    if decoded:
+        lines.append("\n📖 <b>Расшифровка:</b>")
+        lines.extend(decoded)
+    return "\n".join(lines)
+
+
 # ---- форматирование для Telegram ------------------------------------------ #
 def format_metar(m: Metar) -> str:
     if m is None:

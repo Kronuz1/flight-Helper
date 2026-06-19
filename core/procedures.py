@@ -14,6 +14,7 @@ import math
 import re
 from dataclasses import dataclass
 
+from core import router
 from navdata import db
 from navdata.db import Airport, Procedure
 
@@ -130,19 +131,27 @@ def select_sid(dep: Airport, active_rwy: str, dest: Airport | None) -> list[Pick
         return [Pick(p, "по активной ВПП") for p in sids]
 
     route_brg = bearing(dep.lat, dep.lon, dest.lat, dest.lon)
+    g = router.graph()
     scored = []
     for p in sids:
         fix = _last_fix(p)
         if fix is None:
-            scored.append((999.0, p))
+            scored.append((999.0, 999.0, False, p))
             continue
         exit_brg = bearing(dep.lat, dep.lon, fix.lat, fix.lon)
-        scored.append((angdiff(route_brg, exit_brg), p))
+        ang = angdiff(route_brg, exit_brg)
+        _, on_graph = g.resolve(fix.ident, fix.lat, fix.lon)  # точка выхода на трассе?
+        score = ang + (0.0 if on_graph else 60.0)             # штраф за выход не на трассу
+        scored.append((score, ang, on_graph, p))
     scored.sort(key=lambda x: x[0])
-    return [
-        Pick(p, f"выход в сторону маршрута (Δ{diff:.0f}°)" if diff < 900 else "по активной ВПП")
-        for diff, p in scored
-    ]
+    return [_sid_pick(p, ang, on_graph) for _s, ang, on_graph, p in scored]
+
+
+def _sid_pick(p: Procedure, ang: float, on_graph: bool) -> Pick:
+    if ang >= 900:
+        return Pick(p, "по активной ВПП")
+    tail = ", на трассе" if on_graph else ", DCT-выход"
+    return Pick(p, f"выход в сторону маршрута (Δ{ang:.0f}°){tail}")
 
 
 # --------------------------------------------------------------------------- #
@@ -156,19 +165,27 @@ def select_star(dest: Airport, active_rwy: str, dep: Airport | None) -> list[Pic
         return [Pick(p, "по активной ВПП") for p in stars]
 
     inbound_brg = bearing(dest.lat, dest.lon, dep.lat, dep.lon)  # откуда прилетаем
+    g = router.graph()
     scored = []
     for p in stars:
         fix = _first_fix(p)
         if fix is None:
-            scored.append((999.0, p))
+            scored.append((999.0, 999.0, False, p))
             continue
         entry_brg = bearing(dest.lat, dest.lon, fix.lat, fix.lon)
-        scored.append((angdiff(inbound_brg, entry_brg), p))
+        ang = angdiff(inbound_brg, entry_brg)
+        _, on_graph = g.resolve(fix.ident, fix.lat, fix.lon)  # точка входа на трассе?
+        score = ang + (0.0 if on_graph else 60.0)
+        scored.append((score, ang, on_graph, p))
     scored.sort(key=lambda x: x[0])
-    return [
-        Pick(p, f"вход со стороны вылета (Δ{diff:.0f}°)" if diff < 900 else "по активной ВПП")
-        for diff, p in scored
-    ]
+    return [_star_pick(p, ang, on_graph) for _s, ang, on_graph, p in scored]
+
+
+def _star_pick(p: Procedure, ang: float, on_graph: bool) -> Pick:
+    if ang >= 900:
+        return Pick(p, "по активной ВПП")
+    tail = ", на трассе" if on_graph else ", DCT-вход"
+    return Pick(p, f"вход со стороны вылета (Δ{ang:.0f}°){tail}")
 
 
 # --------------------------------------------------------------------------- #

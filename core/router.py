@@ -13,6 +13,7 @@ import heapq
 import math
 from collections import defaultdict
 from dataclasses import dataclass
+from functools import lru_cache
 
 from navdata import db
 
@@ -26,6 +27,29 @@ def _gc_nm(a: tuple[float, float], b: tuple[float, float]) -> float:
     dlat, dlon = lat2 - lat1, lon2 - lon1
     h = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
     return 6371000.0 * 2 * math.asin(math.sqrt(h)) / _NM
+
+
+def great_circle_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Публичная дистанция по большому кругу (морские мили)."""
+    return _gc_nm((lat1, lon1), (lat2, lon2))
+
+
+@lru_cache(maxsize=None)
+def airway_level(name: str) -> str:
+    """Классификация трассы по обозначению: 'U' верхняя, 'L' нижняя, 'N' прочая.
+
+    Эвристика по первой букве ИКАО-обозначения: U… (UL/UM/UN/UP…), J (jet),
+    Q (high RNAV) — верхние; V (Victor) и T (US T-routes) — нижние; остальные
+    (A/B/G/H/L/M/N/P/R/W/Y/Z…) региональные — нейтральные.
+    """
+    n = (name or "").upper()
+    if not n:
+        return "N"
+    if n[0] == "U" or n[0] in ("J", "Q"):
+        return "U"
+    if n[0] in ("V", "T"):
+        return "L"
+    return "N"
 
 
 # --------------------------------------------------------------------------- #
@@ -137,17 +161,18 @@ def _astar(g: AirwayGraph, start: int, goal: int, max_expand: int = 200_000):
         expanded += 1
         if expanded > max_expand:
             return None
-        # рёбра трасс
+        # рёбра трасс (нижние трассы — со штрафом, чтобы джет шёл верхними)
         for nbr, awy, d in g.adj[cur]:
-            ng = gc + d
+            step = d * 1.5 + 5.0 if airway_level(awy) == "L" else d
+            ng = gc + step
             if ng < gscore.get(nbr, 1e18):
                 gscore[nbr] = ng
                 came[nbr] = (cur, awy)
                 f = ng + _gc_nm(g.pos[nbr], goal_pos)
                 heapq.heappush(frontier, (f, ng, nbr))
-        # DCT-перемычки (штраф, чтобы предпочитать трассы)
+        # DCT-перемычки (повышенный штраф, чтобы держаться опубликованных трасс)
         for d, nbr in g.dct_neighbors(cur):
-            ng = gc + d * 1.4 + 10.0
+            ng = gc + d * 1.6 + 20.0
             if ng < gscore.get(nbr, 1e18):
                 gscore[nbr] = ng
                 came[nbr] = (cur, "DCT")
@@ -180,21 +205,25 @@ class Fix:
     lon: float
 
 
-def route_between(start: Fix, goal: Fix) -> list[str]:
-    """Список токенов маршрута: FIX AIRWAY FIX AIRWAY ... (с DCT при разрывах)."""
+def route_with_distance(start: Fix, goal: Fix) -> tuple[list[str], float]:
+    """Токены маршрута (FIX AIRWAY FIX …) и его геометрическая длина в милях."""
     g = graph()
     s_id, s_on = g.resolve(start.ident, start.lat, start.lon)
     e_id, e_on = g.resolve(goal.ident, goal.lat, goal.lon)
 
+    fallback = (
+        [start.ident, "DCT", goal.ident],
+        great_circle_nm(start.lat, start.lon, goal.lat, goal.lon),
+    )
     if s_id is None or e_id is None:
-        return [start.ident, "DCT", goal.ident]
+        return fallback
 
     came = _astar(g, s_id, e_id)
     if came is None:
-        return [start.ident, "DCT", goal.ident]
+        return fallback
     legs = _reconstruct(came, s_id, e_id)
     if legs is None:
-        return [start.ident, "DCT", goal.ident]
+        return fallback
 
     # сборка токенов со схлопыванием участков одной трассы
     tokens: list[str] = [g.ident[s_id]]
@@ -211,9 +240,23 @@ def route_between(start: Fix, goal: Fix) -> list[str]:
             tokens += [awy, g.ident[legs[k][1]]]
             j = k + 1
 
+    # геометрическая длина пути по узлам графа (+ DCT-вход/выход при off-graph точках)
+    node_seq = [s_id] + [node for _, node in legs]
+    dist = sum(
+        _gc_nm(g.pos[node_seq[i - 1]], g.pos[node_seq[i]])
+        for i in range(1, len(node_seq))
+    )
+
     # если точки не лежат на трассах — добавляем DCT-вход/выход с реальной точкой
     if not s_on and start.ident != tokens[0]:
         tokens = [start.ident, "DCT"] + tokens
+        dist += great_circle_nm(start.lat, start.lon, *g.pos[s_id])
     if not e_on and goal.ident != tokens[-1]:
         tokens = tokens + ["DCT", goal.ident]
-    return tokens
+        dist += great_circle_nm(goal.lat, goal.lon, *g.pos[e_id])
+    return tokens, dist
+
+
+def route_between(start: Fix, goal: Fix) -> list[str]:
+    """Список токенов маршрута: FIX AIRWAY FIX AIRWAY ... (с DCT при разрывах)."""
+    return route_with_distance(start, goal)[0]
