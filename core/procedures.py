@@ -140,7 +140,7 @@ def select_sid(dep: Airport, active_rwy: str, dest: Airport | None) -> list[Pick
             continue
         exit_brg = bearing(dep.lat, dep.lon, fix.lat, fix.lon)
         ang = angdiff(route_brg, exit_brg)
-        _, on_graph = g.resolve(fix.ident, fix.lat, fix.lon)  # точка выхода на трассе?
+        _, on_graph = g.resolve(fix.name, fix.lat, fix.lon)  # точка выхода на трассе?
         score = ang + (0.0 if on_graph else 60.0)             # штраф за выход не на трассу
         scored.append((score, ang, on_graph, p))
     scored.sort(key=lambda x: x[0])
@@ -174,7 +174,7 @@ def select_star(dest: Airport, active_rwy: str, dep: Airport | None) -> list[Pic
             continue
         entry_brg = bearing(dest.lat, dest.lon, fix.lat, fix.lon)
         ang = angdiff(inbound_brg, entry_brg)
-        _, on_graph = g.resolve(fix.ident, fix.lat, fix.lon)  # точка входа на трассе?
+        _, on_graph = g.resolve(fix.name, fix.lat, fix.lon)  # точка входа на трассе?
         score = ang + (0.0 if on_graph else 60.0)
         scored.append((score, ang, on_graph, p))
     scored.sort(key=lambda x: x[0])
