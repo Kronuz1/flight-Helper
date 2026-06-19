@@ -1,0 +1,17 @@
+# Render Blueprint — деплой бота как бесплатного web-сервиса (режим webhook).
+# Документация: https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: flightplanner-bot
+    runtime: python
+    plan: free
+    region: frankfurt            # ближайший к Telegram/России регион free-плана
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN           # секрет — задать вручную в дашборде Render
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.13.4"
