@@ -5,6 +5,7 @@ API бесплатный, без ключа и регистрации (NOAA/NWS 
 """
 from __future__ import annotations
 
+import json
 import re
 import time
 from dataclasses import dataclass, field
@@ -83,11 +84,18 @@ def _parse_metar(d: dict) -> Metar:
 
 
 async def _get_json(session: aiohttp.ClientSession, product: str, icao: str):
+    """Запрос к API. Пустой ответ (204 / нет METAR) и не-JSON трактуем как []."""
     url = f"{config.WEATHER_BASE_URL}/{product}"
     params = {"ids": icao, "format": "json"}
     async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=20)) as r:
         r.raise_for_status()
-        return await r.json()
+        text = await r.text()
+    if not text.strip():
+        return []
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return []
 
 
 async def fetch_metar(icao: str) -> Metar | None:
